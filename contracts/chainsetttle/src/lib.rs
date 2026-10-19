@@ -148,6 +148,8 @@ pub struct Milestone {
     pub proof_submitted_ledger: Option<u32>,
     /// Ledger at which dispute was opened; used for escalation threshold check.
     pub dispute_opened_ledger: Option<u32>,
+    /// Earliest ledger at which proof may be submitted (0 = no restriction).
+    pub not_before_ledger: u32,
     /// Ledger by which proof must be submitted to avoid late-delivery penalty and earn early bonus (0 = no deadline).
     pub deadline_ledger: u32,
     /// Basis points penalty per overdue ledger past deadline_ledger (0 = use shipment-level or disabled).
@@ -1695,6 +1697,18 @@ pub enum DataKeyExt4 {
     // ── #621 Append a milestone by mutual consent ─────────────────────────
     /// Pending proposal to append a new milestone to a shipment.
     NewMilestoneProposal(String),
+
+    // ── Split active shipment ─────────────────────────────────────────────
+    /// Pending proposal to split an active shipment into two shipments.
+    SplitShipmentProposal(String),
+
+    // ── Supplier default terms profile ────────────────────────────────────
+    /// Supplier's default terms profile that auto-applies to new shipments.
+    SupplierTermsProfile(Address),
+
+    // ── Milestone not-before ledger proposal ───────────────────────────────
+    /// Pending proposal to set not-before ledger for a milestone.
+    MilestoneNotBeforeProposal(String, u32),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -1709,6 +1723,62 @@ pub struct NewMilestoneProposal {
     pub funded_by: Option<Address>,
     /// Escrow token of the shipment, kept so a deposit stays refundable.
     pub token: Address,
+    pub proposed_at_ledger: u32,
+}
+
+/// Pending proposal to split an active shipment into two shipments.
+/// Requires mutual consent from buyer and supplier.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct SplitShipmentProposal {
+    pub proposer: Address,
+    /// New shipment ID for the second half.
+    pub new_shipment_id: String,
+    /// Milestone indices to move to the new shipment.
+    pub milestone_indices: Vec<u32>,
+    /// Buyer agreed to the split.
+    pub buyer_agreed: bool,
+    /// Supplier agreed to the split.
+    pub supplier_agreed: bool,
+    pub proposed_at_ledger: u32,
+}
+
+/// Supplier's default terms profile that auto-applies to new shipments.
+/// Suppliers can set their preferred payment terms, dispute settings, and collateral preferences.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct SupplierTermsProfile {
+    /// Default holdback ledgers for milestone payments (0 = immediate release).
+    pub default_holdback_ledgers: u32,
+    /// Default dispute cooldown ledgers between successive disputes.
+    pub default_dispute_cooldown_ledgers: u32,
+    /// Default late penalty basis points per ledger of delay.
+    pub default_late_penalty_bps_per_ledger: u32,
+    /// Default auto-confirmation ledgers after proof submission.
+    pub default_auto_confirm_ledgers: u32,
+    /// Default arbiter fee basis points.
+    pub default_arbiter_fee_bps: u32,
+    /// Default logistics fee basis points.
+    pub default_logistics_fee_bps: u32,
+    /// Default supplier collateral percentage (basis points of total_amount).
+    pub default_supplier_collateral_bps: u32,
+    /// Default milestone mode (Sequential or Parallel).
+    pub default_milestone_mode: MilestoneMode,
+    /// Whether to require these terms (true) or allow buyers to override (false).
+    pub enforce_terms: bool,
+    /// Ledger at which the profile was created/updated.
+    pub updated_at_ledger: u32,
+}
+
+/// Pending proposal to set not-before ledger for a milestone.
+/// Requires mutual consent from buyer and supplier.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct MilestoneNotBeforeProposal {
+    pub proposer: Address,
+    pub not_before_ledger: u32,
+    pub buyer_agreed: bool,
+    pub supplier_agreed: bool,
     pub proposed_at_ledger: u32,
 }
 
@@ -7557,6 +7627,77 @@ impl ChainSettleContract {
                 }
             }
         }
+
+        // Apply supplier default terms profile if set and not explicitly overridden.
+        // If supplier enforces terms, override the provided options.
+        let (
+            final_holdback_ledgers,
+            final_dispute_cooldown_ledgers,
+            final_late_penalty_bps,
+            final_auto_confirm_ledgers,
+            final_arbiter_fee_bps,
+            final_logistics_fee_bps,
+            final_supplier_collateral,
+            final_milestone_mode,
+        ) = if let Some(profile) = storage::get_supplier_terms_profile(&env, &supplier) {
+            if profile.enforce_terms {
+                // Supplier enforces their terms - override all
+                (
+                    profile.default_holdback_ledgers,
+                    profile.default_dispute_cooldown_ledgers,
+                    profile.default_late_penalty_bps_per_ledger,
+                    profile.default_auto_confirm_ledgers,
+                    profile.default_arbiter_fee_bps,
+                    profile.default_logistics_fee_bps,
+                    (total_amount * profile.default_supplier_collateral_bps as i128) / 10_000,
+                    profile.default_milestone_mode,
+                )
+            } else {
+                // Use profile as defaults when not explicitly provided
+                (
+                    if holdback_ledgers > 0 {
+                        holdback_ledgers
+                    } else {
+                        profile.default_holdback_ledgers
+                    },
+                    if dispute_cooldown_ledgers > 0 {
+                        dispute_cooldown_ledgers
+                    } else {
+                        profile.default_dispute_cooldown_ledgers
+                    },
+                    if late_penalty_bps_per_ledger > 0 {
+                        late_penalty_bps_per_ledger
+                    } else {
+                        profile.default_late_penalty_bps_per_ledger
+                    },
+                    if auto_confirm_ledgers > 0 {
+                        auto_confirm_ledgers
+                    } else {
+                        profile.default_auto_confirm_ledgers
+                    },
+                    options.arbiter_fee_bps,
+                    logistics_fee_bps,
+                    if supplier_collateral > 0 {
+                        supplier_collateral
+                    } else {
+                        (total_amount * profile.default_supplier_collateral_bps as i128) / 10_000
+                    },
+                    milestone_mode.clone(),
+                )
+            }
+        } else {
+            // No profile set, use provided options as-is
+            (
+                holdback_ledgers,
+                dispute_cooldown_ledgers,
+                late_penalty_bps_per_ledger,
+                auto_confirm_ledgers,
+                options.arbiter_fee_bps,
+                logistics_fee_bps,
+                supplier_collateral,
+                milestone_mode.clone(),
+            )
+        };
 
         let min_pct = ctx.min_pct;
 
@@ -23249,6 +23390,449 @@ impl ChainSettleContract {
                 ));
             }
         }
+    }
+}
+
+// ============================================================
+// SPLIT SHIPMENT, SUPPLIER TERMS PROFILE, MILESTONE NOT-BEFORE
+// ============================================================
+
+#[contractimpl]
+impl ChainSettleContract {
+    // ----------------------------------------------------------
+    // SPLIT ACTIVE SHIPMENT
+    // ----------------------------------------------------------
+
+    /// Propose to split an active shipment into two separate shipments.
+    /// The specified milestones will be moved to a new shipment with the given ID.
+    /// Requires mutual consent from buyer and supplier to execute.
+    pub fn propose_split_shipment(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        new_shipment_id: String,
+        milestone_indices: Vec<u32>,
+    ) {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+
+        // Verify shipment exists and is active
+        let mut shipment = storage::get_shipment(&env, &shipment_id)
+            .unwrap_or_else(|| panic!("shipment not found"));
+        
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment not active");
+        }
+
+        // Verify new shipment ID doesn't already exist
+        if storage::shipment_exists(&env, &new_shipment_id) {
+            panic!("new shipment ID already exists");
+        }
+
+        // Verify caller is buyer or supplier
+        let is_buyer = shipment.buyers.iter().any(|b| b == caller);
+        let is_supplier = shipment.supplier == caller;
+        if !is_buyer && !is_supplier {
+            panic!("unauthorized");
+        }
+
+        // Verify milestone indices are valid and in Pending status
+        if milestone_indices.is_empty() {
+            panic!("no milestones specified");
+        }
+
+        for i in 0..milestone_indices.len() {
+            let idx = milestone_indices.get(i).unwrap();
+            if idx >= shipment.milestones.len() {
+                panic!("invalid milestone index");
+            }
+            let milestone = shipment.milestones.get(idx).unwrap();
+            if milestone.status != MilestoneStatus::Pending {
+                panic!("only pending milestones can be split");
+            }
+        }
+
+        // Create or update proposal
+        let proposal = SplitShipmentProposal {
+            proposer: caller.clone(),
+            new_shipment_id: new_shipment_id.clone(),
+            milestone_indices: milestone_indices.clone(),
+            buyer_agreed: is_buyer,
+            supplier_agreed: is_supplier,
+            proposed_at_ledger: env.ledger().sequence(),
+        };
+
+        storage::set_split_shipment_proposal(&env, &shipment_id, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "split_proposed"), shipment_id),
+            (new_shipment_id, milestone_indices.len()),
+        );
+    }
+
+    /// Agree to a pending split shipment proposal.
+    /// When both buyer and supplier agree, the split is executed.
+    pub fn agree_split_shipment(env: Env, caller: Address, shipment_id: String) {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+
+        let shipment = storage::get_shipment(&env, &shipment_id)
+            .unwrap_or_else(|| panic!("shipment not found"));
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment not active");
+        }
+
+        let is_buyer = shipment.buyers.iter().any(|b| b == caller);
+        let is_supplier = shipment.supplier == caller;
+        if !is_buyer && !is_supplier {
+            panic!("unauthorized");
+        }
+
+        let mut proposal = storage::get_split_shipment_proposal(&env, &shipment_id)
+            .unwrap_or_else(|| panic!("no pending split proposal"));
+
+        // Update agreement status
+        if is_buyer {
+            proposal.buyer_agreed = true;
+        }
+        if is_supplier {
+            proposal.supplier_agreed = true;
+        }
+
+        // If both agreed, execute the split
+        if proposal.buyer_agreed && proposal.supplier_agreed {
+            Self::execute_split_shipment(&env, &shipment_id, &proposal);
+            storage::remove_split_shipment_proposal(&env, &shipment_id);
+
+            env.events().publish(
+                (Symbol::new(&env, "shipment_split"), shipment_id.clone()),
+                proposal.new_shipment_id.clone(),
+            );
+        } else {
+            storage::set_split_shipment_proposal(&env, &shipment_id, &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "split_agreed"), shipment_id),
+                caller,
+            );
+        }
+    }
+
+    /// Cancel a pending split shipment proposal.
+    pub fn cancel_split_shipment(env: Env, caller: Address, shipment_id: String) {
+        caller.require_auth();
+
+        let proposal = storage::get_split_shipment_proposal(&env, &shipment_id)
+            .unwrap_or_else(|| panic!("no pending split proposal"));
+
+        if proposal.proposer != caller {
+            panic!("only proposer can cancel");
+        }
+
+        storage::remove_split_shipment_proposal(&env, &shipment_id);
+
+        env.events().publish(
+            (Symbol::new(&env, "split_cancelled"), shipment_id),
+            caller,
+        );
+    }
+
+    /// Internal: Execute the shipment split after mutual agreement.
+    fn execute_split_shipment(
+        env: &Env,
+        shipment_id: &String,
+        proposal: &SplitShipmentProposal,
+    ) {
+        let mut original_shipment = storage::get_shipment(env, shipment_id)
+            .unwrap_or_else(|| panic!("shipment not found"));
+
+        // Create a new shipment with the split milestones
+        let mut new_milestones = Vec::new(env);
+        let mut remaining_milestones = Vec::new(env);
+        let mut total_split_amount: i128 = 0;
+
+        // Sort indices for proper removal
+        let mut sorted_indices = Vec::new(env);
+        for i in 0..proposal.milestone_indices.len() {
+            sorted_indices.push_back(proposal.milestone_indices.get(i).unwrap());
+        }
+
+        for i in 0..original_shipment.milestones.len() {
+            let milestone = original_shipment.milestones.get(i).unwrap();
+            let should_move = sorted_indices.iter().any(|&idx| idx == i);
+            
+            if should_move {
+                new_milestones.push_back(milestone.clone());
+                let amount = (original_shipment.total_amount * milestone.payment_percent as i128) / 10000;
+                total_split_amount += amount;
+            } else {
+                remaining_milestones.push_back(milestone);
+            }
+        }
+
+        // Update original shipment
+        original_shipment.milestones = remaining_milestones;
+        let remaining_amount = original_shipment.total_amount - total_split_amount;
+        original_shipment.total_amount = remaining_amount;
+        storage::set_shipment(env, shipment_id, &original_shipment);
+
+        // Create new shipment
+        let new_shipment = Shipment {
+            id: proposal.new_shipment_id.clone(),
+            audit_log: Vec::new(env),
+            buyers: original_shipment.buyers.clone(),
+            supplier: original_shipment.supplier.clone(),
+            logistics: original_shipment.logistics.clone(),
+            arbiter: original_shipment.arbiter.clone(),
+            token: original_shipment.token.clone(),
+            total_amount: total_split_amount,
+            released_amount: 0,
+            total_advanced_amount: 0,
+            milestones: new_milestones,
+            status: ShipmentStatus::Active,
+            milestone_mode: original_shipment.milestone_mode.clone(),
+            created_at: env.ledger().sequence(),
+            holdback_ledgers: original_shipment.holdback_ledgers,
+            dispute_cooldown_ledgers: original_shipment.dispute_cooldown_ledgers,
+            last_dispute_resolved_ledger: None,
+            late_penalty_bps_per_ledger: original_shipment.late_penalty_bps_per_ledger,
+            auto_confirm_ledgers: original_shipment.auto_confirm_ledgers,
+            open_dispute_count: 0,
+            dispute_bond_amount: original_shipment.dispute_bond_amount,
+            dispute_bond_bps: original_shipment.dispute_bond_bps,
+            arbiter_fee_bps: original_shipment.arbiter_fee_bps,
+            logistics_fee_bps: original_shipment.logistics_fee_bps,
+            expires_at_ledger: original_shipment.expires_at_ledger,
+            metadata_hash: None,
+            referrer: None,
+            buyer_cancel_fee_bps: original_shipment.buyer_cancel_fee_bps,
+            early_bonus_pool: 0,
+            early_bonus_remaining: 0,
+            review_window_ledgers: original_shipment.review_window_ledgers,
+            dispute_timeout_seconds: original_shipment.dispute_timeout_seconds,
+            default_resolution: original_shipment.default_resolution.clone(),
+            last_confirmed_milestone_index: None,
+            cancellation_reason: Vec::new(env),
+            grace_period_ledgers: original_shipment.grace_period_ledgers,
+        };
+
+        storage::set_shipment(env, &proposal.new_shipment_id, &new_shipment);
+
+        // Update indices
+        storage::push_shipment_id(env, &proposal.new_shipment_id);
+
+        let mut supplier_shipments = storage::get_supplier_shipments(env, &original_shipment.supplier);
+        supplier_shipments.push_back(proposal.new_shipment_id.clone());
+        storage::set_supplier_shipments(env, &original_shipment.supplier, &supplier_shipments);
+
+        for i in 0..original_shipment.buyers.len() {
+            let buyer = original_shipment.buyers.get(i).unwrap();
+            let mut buyer_shipments = storage::get_buyer_shipments(env, &buyer);
+            buyer_shipments.push_back(proposal.new_shipment_id.clone());
+            storage::set_buyer_shipments(env, &buyer, &buyer_shipments);
+        }
+
+        // Update contract stats
+        let mut stats = storage::get_contract_stats(env);
+        stats.total_shipments += 1;
+        stats.total_volume += total_split_amount;
+        storage::set_contract_stats(env, &stats);
+    }
+
+    // ----------------------------------------------------------
+    // SUPPLIER TERMS PROFILE
+    // ----------------------------------------------------------
+
+    /// Set or update the supplier's default terms profile.
+    /// These terms will auto-apply to new shipments unless overridden.
+    pub fn set_supplier_terms_profile(
+        env: Env,
+        supplier: Address,
+        default_holdback_ledgers: u32,
+        default_dispute_cooldown_ledgers: u32,
+        default_late_penalty_bps_per_ledger: u32,
+        default_auto_confirm_ledgers: u32,
+        default_arbiter_fee_bps: u32,
+        default_logistics_fee_bps: u32,
+        default_supplier_collateral_bps: u32,
+        default_milestone_mode: MilestoneMode,
+        enforce_terms: bool,
+    ) {
+        supplier.require_auth();
+        Self::assert_not_paused(&env);
+
+        // Validate basis points
+        if default_arbiter_fee_bps > 10000 {
+            panic!("arbiter fee exceeds 100%");
+        }
+        if default_logistics_fee_bps > 10000 {
+            panic!("logistics fee exceeds 100%");
+        }
+        if default_supplier_collateral_bps > 10000 {
+            panic!("collateral exceeds 100%");
+        }
+
+        let profile = SupplierTermsProfile {
+            default_holdback_ledgers,
+            default_dispute_cooldown_ledgers,
+            default_late_penalty_bps_per_ledger,
+            default_auto_confirm_ledgers,
+            default_arbiter_fee_bps,
+            default_logistics_fee_bps,
+            default_supplier_collateral_bps,
+            default_milestone_mode,
+            enforce_terms,
+            updated_at_ledger: env.ledger().sequence(),
+        };
+
+        storage::set_supplier_terms_profile(&env, &supplier, &profile);
+
+        env.events().publish(
+            (Symbol::new(&env, "terms_profile_set"), supplier),
+            enforce_terms,
+        );
+    }
+
+    /// Get the supplier's default terms profile if set.
+    pub fn get_supplier_terms_profile(env: Env, supplier: Address) -> Option<SupplierTermsProfile> {
+        storage::get_supplier_terms_profile(&env, &supplier)
+    }
+
+    // ----------------------------------------------------------
+    // MILESTONE NOT-BEFORE LEDGER
+    // ----------------------------------------------------------
+
+    /// Propose to set a not-before ledger for a milestone.
+    /// Proof cannot be submitted before this ledger.
+    /// Requires mutual consent from buyer and supplier.
+    pub fn propose_milestone_not_before(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+        not_before_ledger: u32,
+    ) {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+
+        let shipment = storage::get_shipment(&env, &shipment_id)
+            .unwrap_or_else(|| panic!("shipment not found"));
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment not active");
+        }
+
+        if milestone_index >= shipment.milestones.len() {
+            panic!("invalid milestone index");
+        }
+
+        let milestone = shipment.milestones.get(milestone_index).unwrap();
+        if milestone.status != MilestoneStatus::Pending {
+            panic!("milestone not pending");
+        }
+
+        let is_buyer = shipment.buyers.iter().any(|b| b == caller);
+        let is_supplier = shipment.supplier == caller;
+        if !is_buyer && !is_supplier {
+            panic!("unauthorized");
+        }
+
+        let proposal = MilestoneNotBeforeProposal {
+            proposer: caller.clone(),
+            not_before_ledger,
+            buyer_agreed: is_buyer,
+            supplier_agreed: is_supplier,
+            proposed_at_ledger: env.ledger().sequence(),
+        };
+
+        storage::set_milestone_not_before_proposal(&env, &shipment_id, milestone_index, &proposal);
+
+        env.events().publish(
+            (Symbol::new(&env, "not_before_proposed"), shipment_id),
+            (milestone_index, not_before_ledger),
+        );
+    }
+
+    /// Agree to a pending not-before ledger proposal.
+    /// When both buyer and supplier agree, the not-before ledger is set.
+    pub fn agree_milestone_not_before(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        caller.require_auth();
+        Self::assert_not_paused(&env);
+
+        let mut shipment = storage::get_shipment(&env, &shipment_id)
+            .unwrap_or_else(|| panic!("shipment not found"));
+
+        if shipment.status != ShipmentStatus::Active {
+            panic!("shipment not active");
+        }
+
+        let is_buyer = shipment.buyers.iter().any(|b| b == caller);
+        let is_supplier = shipment.supplier == caller;
+        if !is_buyer && !is_supplier {
+            panic!("unauthorized");
+        }
+
+        let mut proposal = storage::get_milestone_not_before_proposal(&env, &shipment_id, milestone_index)
+            .unwrap_or_else(|| panic!("no pending not-before proposal"));
+
+        // Update agreement status
+        if is_buyer {
+            proposal.buyer_agreed = true;
+        }
+        if is_supplier {
+            proposal.supplier_agreed = true;
+        }
+
+        // If both agreed, update the milestone
+        if proposal.buyer_agreed && proposal.supplier_agreed {
+            let mut milestone = shipment.milestones.get(milestone_index).unwrap();
+            milestone.not_before_ledger = proposal.not_before_ledger;
+            shipment.milestones.set(milestone_index, milestone);
+            storage::set_shipment(&env, &shipment_id, &shipment);
+            storage::remove_milestone_not_before_proposal(&env, &shipment_id, milestone_index);
+
+            env.events().publish(
+                (Symbol::new(&env, "not_before_set"), shipment_id.clone()),
+                (milestone_index, proposal.not_before_ledger),
+            );
+        } else {
+            storage::set_milestone_not_before_proposal(&env, &shipment_id, milestone_index, &proposal);
+
+            env.events().publish(
+                (Symbol::new(&env, "not_before_agreed"), shipment_id),
+                (milestone_index, caller),
+            );
+        }
+    }
+
+    /// Cancel a pending not-before ledger proposal.
+    pub fn cancel_milestone_not_before(
+        env: Env,
+        caller: Address,
+        shipment_id: String,
+        milestone_index: u32,
+    ) {
+        caller.require_auth();
+
+        let proposal = storage::get_milestone_not_before_proposal(&env, &shipment_id, milestone_index)
+            .unwrap_or_else(|| panic!("no pending not-before proposal"));
+
+        if proposal.proposer != caller {
+            panic!("only proposer can cancel");
+        }
+
+        storage::remove_milestone_not_before_proposal(&env, &shipment_id, milestone_index);
+
+        env.events().publish(
+            (Symbol::new(&env, "not_before_cancelled"), shipment_id),
+            (milestone_index, caller),
+        );
     }
 }
 

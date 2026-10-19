@@ -671,3 +671,77 @@ pub fn migrate_v1_to_v2(_env: &Env) {
     //     }
     // }
 }
+
+// ============================================================
+// SPLIT SHIPMENT PROPOSAL ACCESSORS
+// ============================================================
+
+pub fn get_split_shipment_proposal(env: &Env, shipment_id: &String) -> Option<crate::SplitShipmentProposal> {
+    env.storage()
+        .temporary()
+        .get(&crate::DataKeyExt4::SplitShipmentProposal(shipment_id.clone()))
+}
+
+pub fn set_split_shipment_proposal(env: &Env, shipment_id: &String, proposal: &crate::SplitShipmentProposal) {
+    env.storage()
+        .temporary()
+        .set(&crate::DataKeyExt4::SplitShipmentProposal(shipment_id.clone()), proposal);
+}
+
+pub fn remove_split_shipment_proposal(env: &Env, shipment_id: &String) {
+    env.storage()
+        .temporary()
+        .remove(&crate::DataKeyExt4::SplitShipmentProposal(shipment_id.clone()));
+}
+
+// ============================================================
+// SUPPLIER TERMS PROFILE ACCESSORS
+// ============================================================
+
+pub fn get_supplier_terms_profile(env: &Env, supplier: &Address) -> Option<crate::SupplierTermsProfile> {
+    env.storage()
+        .persistent()
+        .get(&crate::DataKeyExt4::SupplierTermsProfile(supplier.clone()))
+}
+
+pub fn set_supplier_terms_profile(env: &Env, supplier: &Address, profile: &crate::SupplierTermsProfile) {
+    let key = crate::DataKeyExt4::SupplierTermsProfile(supplier.clone());
+    env.storage().persistent().set(&key, profile);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, TTL_INITIAL_LEDGERS, TTL_MAX_LEDGERS);
+}
+
+// ============================================================
+// MILESTONE NOT-BEFORE PROPOSAL ACCESSORS
+// ============================================================
+
+pub fn get_milestone_not_before_proposal(
+    env: &Env,
+    shipment_id: &String,
+    milestone_index: u32,
+) -> Option<crate::MilestoneNotBeforeProposal> {
+    env.storage()
+        .temporary()
+        .get(&crate::DataKeyExt4::MilestoneNotBeforeProposal(shipment_id.clone(), milestone_index))
+}
+
+pub fn set_milestone_not_before_proposal(
+    env: &Env,
+    shipment_id: &String,
+    milestone_index: u32,
+    proposal: &crate::MilestoneNotBeforeProposal,
+) {
+    env.storage()
+        .temporary()
+        .set(
+            &crate::DataKeyExt4::MilestoneNotBeforeProposal(shipment_id.clone(), milestone_index),
+            proposal,
+        );
+}
+
+pub fn remove_milestone_not_before_proposal(env: &Env, shipment_id: &String, milestone_index: u32) {
+    env.storage()
+        .temporary()
+        .remove(&crate::DataKeyExt4::MilestoneNotBeforeProposal(shipment_id.clone(), milestone_index));
+}
