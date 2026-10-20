@@ -493,6 +493,10 @@ pub struct ShipmentOptions {
     /// Alternative address to receive refunds in place of the buyer.
     /// None = refunds go to the buyer (default unchanged behaviour).
     pub refund_recipient: Option<Address>,
+
+    // ── Encrypted evidence for arbiters ──────────────────────────────────
+    /// When true, encrypted evidence key envelopes are required for disputes.
+    pub require_encrypted_evidence: bool,
 }
 
 /// #545 – Pending dual-attestation proof awaiting the second party.
@@ -748,6 +752,22 @@ pub struct DisputeRecord {
     pub milestone_index: u32,
     pub opened_ledger: u32,
     pub outcome: DisputeOutcome,
+}
+
+/// Encrypted evidence key envelope for arbiters.
+/// The evidence decryption key is encrypted with the arbiter's public key,
+/// allowing only the designated arbiter to access off-chain evidence.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct EncryptedEvidenceEnvelope {
+    /// Base64-encoded encrypted key, encrypted with arbiter's public key.
+    pub encrypted_key: String,
+    /// Arbiter address whose public key was used for encryption.
+    pub arbiter: Address,
+    /// Ledger at which this envelope was created.
+    pub created_ledger: u32,
+    /// Optional reference to the evidence location (IPFS CID, S3 URI, etc).
+    pub evidence_uri: Option<String>,
 }
 
 /// Supplier advance payment request for a milestone.
@@ -1699,6 +1719,15 @@ pub enum DataKeyExt4 {
     // ── #621 Append a milestone by mutual consent ─────────────────────────
     /// Pending proposal to append a new milestone to a shipment.
     NewMilestoneProposal(String),
+
+    // ── Supplier-initiated voluntary refund ───────────────────────────────
+    /// Pending voluntary refund requested by the supplier for a milestone.
+    /// Value: (requested_amount, reason_hash, requested_ledger).
+    VoluntaryRefund(String, u32),
+
+    // ── Encrypted evidence key envelopes for arbiters ─────────────────────
+    /// Encrypted evidence key envelope for a dispute on (shipment_id, milestone_index).
+    DisputeEvidenceEnvelope(String, u32),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
