@@ -255,6 +255,10 @@ pub struct Shipment {
     /// Configurable grace period (in ledgers) before late-delivery penalty accrual starts.
     /// When set > 0, penalties only start counting from (deadline + grace_period_ledgers).
     pub grace_period_ledgers: u32,
+
+    /// Supplier payout address distinct from signing address.
+    /// When set, milestone payments go to this address instead of `supplier`.
+    pub supplier_payout_address: Option<Address>,
 }
 
 /// Cancellation policy stored separately (keeps Shipment within the contracttype field limit).
