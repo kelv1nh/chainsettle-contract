@@ -1,22 +1,191 @@
 //! Storage abstraction layer for the ChainSettle contract.
-//!
-//! This module is the **single source of truth** for all persistent, instance,
-//! and temporary storage access. Every read and write to contract state MUST go
-//! through the typed accessor functions defined here.
-//!
-//! Design notes:
-//! - All [`DataKey`] variants are versioned with a `V1` prefix so that a future
-//!   upgrade can introduce `V2_*` keys and run [`migrate_v1_to_v2`] without
-//!   clobbering live state.
-//! - TTL extension is centralised inside each `set_*` helper so callers never
-//!   need to remember to extend manually.
-//! - Extended/feature keys that are not yet covered by `V1DataKey` live in
-//!   [`crate::DataKeyExt`] (defined in `lib.rs`) and are accessed inline; they
-//!   will be migrated to this module incrementally.
-//!
-//! Resolves issue #220 — this file was previously unreachable because `mod storage;`
-//! was absent from `lib.rs`. The declaration has been restored and this module is
-//! now the canonical storage layer for all production code.
+//!.
+        };
+        use proptest::prelude::*;
+        use soroban_sdk::{testutils::Address as _, token, vec, Address, BytesN, Env, String};
+
+        fn make_test_env() -> (Env, Address, Address, Address, Address, Address, Address) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let contract_id = env.register(ChainSettleContract, ());
+            let token_admin = Address::generate(&env);
+            let token_id = env
+                .register_stellar_asset_contract_v2(token_admin.clone())
+                .address();
+            let buyer = Address::generate(&env);
+            let supplier = Address::generate(&env);
+            let logistics = Address::generate(&env);
+            let arbiter = Address::generate(&env);
+            token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &100_000_000_000i128);
+            ChainSettleContractClient::new(&env, &contract_id).init(&buyer);
+            (
+                env,
+                contract_id,
+                token_id,
+                buyer,
+                supplier,
+                logistics,
+                arbiter,
+            )
+        }
+
+        fn default_options(env: &Env) -> ShipmentOptions {
+            ShipmentOptions {
+                response_deadline: 0,
+                penalty_bps: 0,
+                milestone_mode: MilestoneMode::Parallel,
+                holdback_ledgers: 0,
+                dispute_cooldown_ledgers: 0,
+                late_penalty_bps_per_ledger: 0,
+                auto_confirm_ledgers: 0,
+                dispute_bond_amount: 0,
+                dispute_bond_bps: 0,
+                arbiter_fee_bps: 0,
+                logistics_fee_bps: 0,
+                supplier_collateral: 0,
+                expires_at_ledger: None,
+                metadata_hash: None,
+                referrer: None,
+                buyer_cancel_fee_bps: 0,
+                early_bonus_pool: 0,
+                review_window_ledgers: None,
+                milestone_splits: vec![env],
+                deadlines: vec![env],
+                dispute_timeout_seconds: 0,
+                default_resolution: Resolution::Buyer,
+                backup_arbiter: None,
+                confirmation_cooldown_ledgers: None,
+                arbiter_panel: vec![env],
+                jurisdiction: None,
+                grace_period_ledgers: 0,
+                quality_grades: vec![env],
+                milestone_quantities: vec![env],
+                retainage_bps: 0,
+                warranty_bps: 0,
+                warranty_ledgers: 0,
+                inspector: None,
+                inspected_milestones: vec![env],
+                proof_submitters: vec![env],
+                require_dual_attestation: false,
+                fund_from_vault: false,
+                milestone_suppliers: vec![env],
+                refund_recipient: None,
+            }
+        }
+
+        fn milestone(env: &Env, name: &str, pct: u32) -> Milestone {
+            Milestone {
+                name: String::from_str(env, name),
+                payment_percent: pct,
+                proof_hash: String::from_str(env, ""),
+                status: MilestoneStatus::Pending,
+                release_after_ledger: 0,
+                proof_submitted_ledger: None,
+                dispute_opened_ledger: None,
+                deadline_ledger: 0,
+                penalty_bps_per_ledger: 0,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(proptest::test_runner::Config {
+                cases: 200,
+                ..Default::default()
+            })]
+
+            /// Valid two-milestone splits (both >= 5, sum == 100) are accepted by the contract.
+            #[test]
+            fn prop_contract_accepts_valid_two_split(first in 5u32..=90u32) {
+                let second = 100u32 - first;
+                if second < 5 {
+                    return Ok(());
+                }
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-VALID");
+                let ms = vec![&env, milestone(&env, "M0", first), milestone(&env, "M1", second)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(&env),
+                );
+                prop_assert!(
+                    result.is_ok(),
+                    "valid split ({}, {}) must be accepted", first, second
+                );
+            }
+
+            /// Any milestone percentage below 5 (the default minimum) is rejected.
+            #[test]
+            fn prop_contract_rejects_below_min_percent(below in 1u32..=4u32) {
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-LOW");
+                let above = 100 - below;
+                let ms = vec![&env, milestone(&env, "M0", below), milestone(&env, "M1", above)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(&env),
+                );
+                prop_assert!(
+                    result.is_err(),
+                    "percent {} below minimum must be rejected", below
+                );
+            }
+
+            /// Two-milestone sets whose percentages sum to something other than 100 are rejected.
+            #[test]
+            fn prop_contract_rejects_non_100_sum(
+                first in 5u32..=45u32,
+                second in 5u32..=45u32,
+            ) {
+                let sum = first + second;
+                if sum == 100 { return Ok(()); }
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-BADSUM");
+                let ms = vec![&env, milestone(&env, "M0", first), milestone(&env, "M1", second)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(&env),
+                );
+                prop_assert!(
+                    result.is_err(),
+                    "sum {} != 100 must be rejected", sum
+                );
+            }
+
+            /// A single 100% milestone (at or above the minimum) is always valid.
+            #[test]
+            fn prop_contract_accepts_single_100_milestone(_seed in 0u32..10u32) {
+                let (env, cid, tid, buyer, supplier, logistics, arbiter) = make_test_env();
+                let client = ChainSettleContractClient::new(&env, &cid);
+                let sid = String::from_str(&env, "PCT-SINGLE");
+                let ms = vec![&env, milestone(&env, "M0", 100)];
+                let result = client.try_create_shipment(
+                    &sid,
+                    &vec![&env, buyer.clone()],
+                    &supplier, &logistics, &arbiter, &tid,
+                    &1_000_000i128,
+                    &ms,
+                    &default_options(&env),
+                );
+                prop_assert!(result.is_ok(), "single 100% milestone must be accepted");
+            }
+        }
+    }
+}
 
 use soroban_sdk::{contracttype, Address, Env, String, Vec};
 
