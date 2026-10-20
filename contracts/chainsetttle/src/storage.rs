@@ -643,6 +643,343 @@ pub fn set_arbiter_stats(env: &Env, arbiter: &Address, stats: &crate::ArbiterSta
 }
 
 // ============================================================
+// STORAGE PRUNING FOR SHIPMENT FINALIZATION
+// ============================================================
+
+/// Prune auxiliary storage keys that are no longer needed after a shipment
+/// reaches a terminal state (Completed, Cancelled, or Expired).
+///
+/// This reclaims storage rent by removing:
+/// - Temporary keys (amendments, arbiter rotation proposals)
+/// - Ephemeral tracking (proof submitted ledgers, dispute timestamps)
+/// - Pending requests/proposals that are now moot
+///
+/// Should be called by shipment finalization logic after status is set to a terminal state.
+pub fn prune_shipment_auxiliary_keys(env: &Env, shipment_id: &String, milestone_count: u32) {
+    // Remove temporary proposal keys
+    remove_arbiter_rotation(env, shipment_id);
+    
+    // Remove per-milestone auxiliary keys
+    for idx in 0..milestone_count {
+        // Remove amendment proposals
+        remove_amendment(env, shipment_id, idx);
+        
+        // Remove proof submission timestamp tracking
+        env.storage()
+            .persistent()
+            .remove(&DataKey::V1ProofSubmittedAt(shipment_id.clone(), idx));
+    }
+    
+    // Remove extended keys (DataKeyExt)
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::MilestoneSplits(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::MilestoneTimestampDeadlines(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::ShipmentFeeBps(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::BackupArbiter(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::ShipmentConfirmationCooldown(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::DisputeDecayStartLedger(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt::ArbiterPanel(shipment_id.clone()));
+    
+    // Remove per-milestone extended keys
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::MilestoneInvoiceHash(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::AmendmentLog(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::ExtensionRequest(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::MilestoneDeadline(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::DisputeOpenedAt(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::EffectiveDisputeBond(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::DisputeVotes(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::MilestonePayees(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::ProofSubmitter(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::MilestoneNotes(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt::DisputeEvidence(shipment_id.clone(), idx));
+    }
+    
+    // Remove DataKeyExt2 keys
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::CoBuyer(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::ComplianceHold(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::ShipmentMediator(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::ShipmentPaused(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::ShipmentPauseRequest(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::ShipmentPausedAt(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::QualityGrades(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::MilestoneQuantities(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::RetainageBps(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt2::WarrantyConfig(shipment_id.clone()));
+    
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt2::JointConfirmation(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt2::DisputeResolvedAtLedger(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt2::DisputeAppealed(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt2::MediationProposal(shipment_id.clone(), idx));
+    }
+    
+    // Remove DataKeyExt3 keys
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::MilestoneGrade(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::PendingGrade(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::GradeDispute(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::DeliveredQuantity(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::PartialQtyReleased(shipment_id.clone(), idx));
+    }
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::IncrementalCollateral(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::IncrementalCollateralBase(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::MilestoneMergeProposal(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::MilestoneSplitProposal(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::ShipmentInspector(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::InspectedMilestones(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::ProofSubmitters(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt3::RequireDualAttestation(shipment_id.clone()));
+    
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::InspectionReport(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::PendingDualProof(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt3::ConditionBreachReports(shipment_id.clone(), idx));
+    }
+    
+    // Remove DataKeyExt4 keys
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::ShipmentFeesPaid(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::ShipmentHadDispute(shipment_id.clone()));
+    
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt4::SubstituteProposal(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt4::MilestoneSupplier(shipment_id.clone(), idx));
+    }
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::PendingExpiryExtension(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::TotalExpiryExtended(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::CollateralToken(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::FundFromVault(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::PayoutAssignment(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::LoserPaysArbiterFee(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::CompletedAtLedger(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::RefundRecipient(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::IsConsortium(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::CollateralSlashBpsPerMiss(shipment_id.clone()));
+    
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&crate::DataKeyExt4::CollateralSlashedForMiss(shipment_id.clone(), idx));
+    }
+    
+    env.storage()
+        .persistent()
+        .remove(&crate::DataKeyExt4::NewMilestoneProposal(shipment_id.clone()));
+    
+    // Remove DataKey keys that are temporary
+    env.storage()
+        .persistent()
+        .remove(&DataKey::ConfirmationDelegate(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PendingRecovery(shipment_id.clone()));
+    
+    env.storage()
+        .persistent()
+        .remove(&DataKey::SupplierCollateral(shipment_id.clone()));
+    
+    for idx in 0..milestone_count {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AdvanceRequest(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&DataKey::MilestoneProofWhitelist(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&DataKey::SubmittedProofType(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DisputeContestedPercent(shipment_id.clone(), idx));
+        
+        env.storage()
+            .persistent()
+            .remove(&DataKey::EvidenceCount(shipment_id.clone(), idx));
+    }
+}
+
+// ============================================================
 // MIGRATION STUB  (#77)
 // Call once after a contract upgrade that introduces V2_* keys.
 // Currently a no-op; add data-model transformation logic here.

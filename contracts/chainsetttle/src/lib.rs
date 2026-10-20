@@ -12528,6 +12528,10 @@ impl ChainSettleContract {
             shipment_id,
         );
         Self::settle_on_completion(env, shipment_id, shipment);
+        
+        // Prune auxiliary storage keys now that the shipment is completed
+        let milestone_count = shipment.milestones.len();
+        storage::prune_shipment_auxiliary_keys(env, shipment_id, milestone_count);
     }
 
     // ----------------------------------------------------------
@@ -13262,6 +13266,10 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::ActiveDisputes, &new_disputes);
+
+        // Prune auxiliary storage keys now that the shipment is cancelled
+        let milestone_count = shipment.milestones.len();
+        storage::prune_shipment_auxiliary_keys(env, shipment_id, milestone_count);
 
         env.events().publish(
             (Symbol::new(env, "shipment_cancelled"), shipment_id.clone()),
