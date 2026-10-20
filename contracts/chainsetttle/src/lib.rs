@@ -257,6 +257,10 @@ pub struct Shipment {
     /// Configurable grace period (in ledgers) before late-delivery penalty accrual starts.
     /// When set > 0, penalties only start counting from (deadline + grace_period_ledgers).
     pub grace_period_ledgers: u32,
+
+    /// Supplier payout address distinct from signing address.
+    /// When set, milestone payments go to this address instead of `supplier`.
+    pub supplier_payout_address: Option<Address>,
 }
 
 /// Cancellation policy stored separately (keeps Shipment within the contracttype field limit).
@@ -491,6 +495,10 @@ pub struct ShipmentOptions {
     /// Alternative address to receive refunds in place of the buyer.
     /// None = refunds go to the buyer (default unchanged behaviour).
     pub refund_recipient: Option<Address>,
+
+    // ── Encrypted evidence for arbiters ──────────────────────────────────
+    /// When true, encrypted evidence key envelopes are required for disputes.
+    pub require_encrypted_evidence: bool,
 }
 
 /// #545 – Pending dual-attestation proof awaiting the second party.
@@ -746,6 +754,22 @@ pub struct DisputeRecord {
     pub milestone_index: u32,
     pub opened_ledger: u32,
     pub outcome: DisputeOutcome,
+}
+
+/// Encrypted evidence key envelope for arbiters.
+/// The evidence decryption key is encrypted with the arbiter's public key,
+/// allowing only the designated arbiter to access off-chain evidence.
+#[contracttype]
+#[derive(Clone, PartialEq, Debug)]
+pub struct EncryptedEvidenceEnvelope {
+    /// Base64-encoded encrypted key, encrypted with arbiter's public key.
+    pub encrypted_key: String,
+    /// Arbiter address whose public key was used for encryption.
+    pub arbiter: Address,
+    /// Ledger at which this envelope was created.
+    pub created_ledger: u32,
+    /// Optional reference to the evidence location (IPFS CID, S3 URI, etc).
+    pub evidence_uri: Option<String>,
 }
 
 /// Supplier advance payment request for a milestone.
@@ -1698,17 +1722,14 @@ pub enum DataKeyExt4 {
     /// Pending proposal to append a new milestone to a shipment.
     NewMilestoneProposal(String),
 
-    // ── Split active shipment ─────────────────────────────────────────────
-    /// Pending proposal to split an active shipment into two shipments.
-    SplitShipmentProposal(String),
+    // ── Supplier-initiated voluntary refund ───────────────────────────────
+    /// Pending voluntary refund requested by the supplier for a milestone.
+    /// Value: (requested_amount, reason_hash, requested_ledger).
+    VoluntaryRefund(String, u32),
 
-    // ── Supplier default terms profile ────────────────────────────────────
-    /// Supplier's default terms profile that auto-applies to new shipments.
-    SupplierTermsProfile(Address),
-
-    // ── Milestone not-before ledger proposal ───────────────────────────────
-    /// Pending proposal to set not-before ledger for a milestone.
-    MilestoneNotBeforeProposal(String, u32),
+    // ── Encrypted evidence key envelopes for arbiters ─────────────────────
+    /// Encrypted evidence key envelope for a dispute on (shipment_id, milestone_index).
+    DisputeEvidenceEnvelope(String, u32),
 }
 
 /// #621 – Pending proposal to append a milestone to an active shipment.
@@ -12669,6 +12690,10 @@ impl ChainSettleContract {
             shipment_id,
         );
         Self::settle_on_completion(env, shipment_id, shipment);
+        
+        // Prune auxiliary storage keys now that the shipment is completed
+        let milestone_count = shipment.milestones.len();
+        storage::prune_shipment_auxiliary_keys(env, shipment_id, milestone_count);
     }
 
     // ----------------------------------------------------------
@@ -13403,6 +13428,10 @@ impl ChainSettleContract {
         env.storage()
             .persistent()
             .set(&DataKey::ActiveDisputes, &new_disputes);
+
+        // Prune auxiliary storage keys now that the shipment is cancelled
+        let milestone_count = shipment.milestones.len();
+        storage::prune_shipment_auxiliary_keys(env, shipment_id, milestone_count);
 
         env.events().publish(
             (Symbol::new(env, "shipment_cancelled"), shipment_id.clone()),
@@ -23916,3 +23945,106 @@ mod test_new_milestone;
 // Disabled: exercises milestone insurance holdback / oracle price-condition
 // APIs (see NEW_MILESTONE_FEATURES.md) that have not been implemented yet.
 // mod test_milestone_insurance_and_oracle;
+/// Minimum TTL ledgers for persistent storage entries (~1 day at 5s/ledger).
+pub const TTL_INITIAL_LEDGERS: u32 = 100_000;
+
+/// Maximum TTL ledgers for persistent storage entries (~1 year at 5s/ledger).
+/// 6_300_000 ≈ 5s × 86_400s/day × 365 days.
+pub const TTL_MAX_LEDGERS: u32 = 6_300_000;
+
+/// Minimum shipment amount in token base units (stroops). Must be > 0.
+pub const MIN_SHIPMENT_AMOUNT: i128 = 1;
+
+/// Maximum platform fee in basis points (1000 bps = 10%).
+pub const MAX_FEE_BPS: u32 = 1_000;
+
+/// Ledgers after shipment creation before emergency recovery is allowed.
+/// ≈ 2 years at 5s/ledger: 5s × 86_400s/day × 365 days × 2.
+pub const RECOVERY_THRESHOLD_LEDGERS: u32 = 12_614_400;
+
+/// Maximum entries retained in the bounded admin action audit log.
+pub const AUDIT_LOG_MAX_ENTRIES: usize = 50;
+
+/// Maximum entries retained in the per-shipment audit log (ring-buffer).
+pub const SHIPMENT_AUDIT_LOG_MAX_ENTRIES: usize = 20;
+
+/// Maximum shipments returned per page in list_shipments.
+pub const LIST_SHIPMENTS_MAX_PAGE: u32 = 50;
+
+/// Maximum shipments returned per page in `get_shipments_by_token` (#629).
+pub const LIST_SHIPMENTS_BY_TOKEN_MAX_PAGE: u32 = 50;
+
+/// Default maximum number of milestones allowed per shipment when the admin
+/// has not configured an override (#364). Chosen well above any milestone
+/// count exercised by existing tests/benchmarks so default behaviour is
+/// unchanged until an admin opts in to a different cap.
+pub const DEFAULT_MAX_MILESTONE_COUNT: u32 = 50;
+
+/// Default supermajority (basis points) of registered multisig admins
+/// required to activate/lift an emergency global freeze (#402) when the
+/// admin has not configured an override. 8000 = 80%.
+pub const DEFAULT_EMERGENCY_FREEZE_SUPERMAJORITY_BPS: u32 = 8_000;
+
+/// Max shipments accepted by `batch_cancel_shipments` (#580) in one call.
+pub const MAX_BATCH_CANCEL_SHIPMENTS: u32 = 20;
+
+/// Max proof entries accepted by `batch_submit_proofs` (#666) in one call.
+pub const MAX_BATCH_PROOF_SUBMISSIONS: u32 = 20;
+
+/// Max arbiters accepted by `batch_add_arbiters_to_pool` (#663) in one call.
+pub const MAX_BATCH_ADD_ARBITERS: u32 = 20;
+
+/// Smallest panel size accepted for automatic panel escalation (#665),
+/// matching the minimum enforced by `assign_dispute_panel`.
+pub const MIN_ESCALATION_PANEL_SIZE: u32 = 3;
+
+/// Maximum basis points a shipment creator may configure for a value-scaled
+/// dispute bond (#391) when the admin has not set a stricter cap via
+/// `set_max_dispute_bond_bps`. 2000 = 20% of shipment value.
+pub const DEFAULT_MAX_DISPUTE_BOND_BPS: u32 = 2_000;
+
+/// Default supplier onboarding stake amount (can be configured by admin).
+pub const DEFAULT_SUPPLIER_STAKE: i128 = 1_000_000;
+
+/// Number of dispute losses before supplier stake is slashed (default 3).
+pub const DEFAULT_DISPUTE_LOSS_THRESHOLD: u32 = 3;
+
+/// Percentage of stake slashed per dispute loss (default 33.33% = 3333 bps).
+pub const DEFAULT_SLASH_PERCENTAGE_BPS: u32 = 3_333;
+
+/// Maximum number of quality grades a shipment may configure (#519).
+pub const MAX_QUALITY_GRADES: u32 = 10;
+
+/// Grade review window (in ledgers) used by `confirm_milestone_graded` when the
+/// shipment has neither a holdback nor a review/auto-confirm window configured
+/// (#519). ~1 day at 5 s/ledger.
+pub const DEFAULT_GRADE_REVIEW_WINDOW_LEDGERS: u32 = 17_280;
+
+/// Maximum retainage a shipment may withhold from each milestone payment (#520).
+pub const MAX_RETAINAGE_BPS: u32 = 2_000;
+
+/// Maximum warranty holdback a shipment may withhold from each milestone payment (#521).
+pub const MAX_WARRANTY_BPS: u32 = 2_000;
+
+/// Semantic contract version — must match `contracts/chainsetttle/Cargo.toml`.
+/// #571
+pub const VERSION_MAJOR: u32 = 0;
+pub const VERSION_MINOR: u32 = 1;
+pub const VERSION_PATCH: u32 = 0;
+
+/// Storage schema version written by `migrate` (#571). Bump when persistent
+/// layout changes require a post-upgrade migration.
+pub const STORAGE_SCHEMA_VERSION: u32 = 1;
+
+/// Default max shipment IDs accepted by `get_shipment_summaries` in one call
+/// when the admin has not configured an override (#575).
+pub const DEFAULT_MAX_SUMMARY_BATCH: u32 = 50;
+
+/// Maximum entries retained in a per-address dispute history (#577), ring-buffer
+/// style like `SHIPMENT_AUDIT_LOG_MAX_ENTRIES` (oldest dropped on overflow).
+pub const DISPUTE_HISTORY_MAX_ENTRIES: usize = 100;
+
+/// Maximum number of parties checked against the external compliance registry
+/// per `create_shipment` call (#652). Bounds the number of cross-contract
+/// calls so a single shipment cannot exhaust the instruction budget.
+pub const MAX_COMPLIANCE_PARTIES: u32 = 8;
